@@ -94,6 +94,12 @@ type ImageVerification struct {
 	// +kubebuilder:validation:Optional
 	MutateDigest bool `json:"mutateDigest" yaml:"mutateDigest"`
 
+	// MutateEnvWithSignature enables alteration of pod environment with the docker image signature.
+	// Defaults to false.
+	// +kubebuilder:default=false
+	// +kubebuilder:validation:Optional
+	MutateEnvWithSignature bool `json:"mutateEnvWithSignature" yaml:"mutateEnvWithSignature"`
+
 	// VerifyDigest validates that images have a digest.
 	// +kubebuilder:default=true
 	// +kubebuilder:validation:Optional

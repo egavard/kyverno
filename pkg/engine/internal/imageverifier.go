@@ -216,6 +216,7 @@ func (iv *ImageVerifier) Verify(
 ) ([]jsonpatch.JsonPatchOperation, []*engineapi.RuleResponse) {
 	var responses []*engineapi.RuleResponse
 	var patches []jsonpatch.JsonPatchOperation
+	var attestations []images.Response
 
 	// for backward compatibility
 	imageVerify = *imageVerify.Convert()
@@ -257,14 +258,16 @@ func (iv *ImageVerifier) Verify(
 
 		var ruleResp *engineapi.RuleResponse
 		var digest string
+		var cosignResponses []images.Response
 		if isInCache {
 			iv.logger.V(2).Info("cache entry found", "namespace", iv.policyContext.Policy().GetNamespace(), "policy", iv.policyContext.Policy().GetName(), "ruleName", iv.rule.Name, "imageRef", image)
 			ruleResp = engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, "verified from cache")
 			digest = imageInfo.Digest
 		} else {
 			iv.logger.V(2).Info("cache entry not found", "namespace", iv.policyContext.Policy().GetNamespace(), "policy", iv.policyContext.Policy().GetName(), "ruleName", iv.rule.Name, "imageRef", image)
-			ruleResp, digest = iv.verifyImage(ctx, imageVerify, imageInfo, cfg)
+			ruleResp, digest, cosignResponses = iv.verifyImage(ctx, imageVerify, imageInfo, cfg)
 			if ruleResp != nil && ruleResp.Status() == engineapi.RuleStatusPass {
+				attestations = append(attestations, cosignResponses...)
 				if iv.ivCache != nil {
 					setted, err := iv.ivCache.Set(ctx, iv.policyContext.Policy(), iv.rule.Name, image)
 					if err != nil {
@@ -293,6 +296,15 @@ func (iv *ImageVerifier) Verify(
 			}
 		}
 
+		if imageVerify.MutateEnvWithSignature {
+			patchList, err := iv.handleMutateEnvWithSignatures(ctx, imageInfo, attestations)
+			if err == nil {
+				for _, patch := range patchList {
+					patches = append(patches, patch)
+				}
+			}
+		}
+
 		if ruleResp != nil {
 			if len(imageVerify.Attestors) > 0 || len(imageVerify.Attestations) > 0 {
 				iv.ivm.Add(image, ruleResp.Status() == engineapi.RuleStatusPass)
@@ -308,9 +320,9 @@ func (iv *ImageVerifier) verifyImage(
 	imageVerify kyvernov1.ImageVerification,
 	imageInfo apiutils.ImageInfo,
 	cfg config.Configuration,
-) (*engineapi.RuleResponse, string) {
+) (*engineapi.RuleResponse, string, []images.Response) {
 	if len(imageVerify.Attestors) <= 0 && len(imageVerify.Attestations) <= 0 {
-		return nil, ""
+		return nil, "", nil
 	}
 	image := imageInfo.String()
 	for _, att := range imageVerify.Attestations {
@@ -321,21 +333,21 @@ func (iv *ImageVerifier) verifyImage(
 	iv.logger.V(2).Info("verifying image signatures", "image", image, "attestors", len(imageVerify.Attestors), "attestations", len(imageVerify.Attestations))
 	if err := iv.policyContext.JSONContext().AddImageInfo(imageInfo, cfg); err != nil {
 		iv.logger.Error(err, "failed to add image to context")
-		return engineapi.RuleError(iv.rule.Name, engineapi.ImageVerify, fmt.Sprintf("failed to add image to context %s", image), err), ""
+		return engineapi.RuleError(iv.rule.Name, engineapi.ImageVerify, fmt.Sprintf("failed to add image to context %s", image), err), "", nil
 	}
 	if len(imageVerify.Attestors) > 0 {
 		if !matchImageReferences(imageVerify.ImageReferences, image) {
-			return nil, ""
+			return nil, "", nil
 		}
 		ruleResp, cosignResp := iv.verifyAttestors(ctx, imageVerify.Attestors, imageVerify, imageInfo, "")
 		if ruleResp.Status() != engineapi.RuleStatusPass {
-			return ruleResp, ""
+			return ruleResp, "", nil
 		}
 		if imageInfo.Digest == "" {
 			imageInfo.Digest = cosignResp.Digest
 		}
 		if len(imageVerify.Attestations) == 0 {
-			return ruleResp, cosignResp.Digest
+			return ruleResp, cosignResp.Digest, nil
 		}
 	}
 
@@ -382,15 +394,16 @@ func (iv *ImageVerifier) verifyAttestations(
 	ctx context.Context,
 	imageVerify kyvernov1.ImageVerification,
 	imageInfo apiutils.ImageInfo,
-) (*engineapi.RuleResponse, string) {
+) (*engineapi.RuleResponse, string, []images.Response) {
 	image := imageInfo.String()
+	attestations := make([]images.Response, 0)
 	for i, attestation := range imageVerify.Attestations {
 		var attestationError error
 		path := fmt.Sprintf(".attestations[%d]", i)
 
 		iv.logger.V(2).Info(fmt.Sprintf("attestation %+v", attestation))
 		if attestation.Type == "" && attestation.PredicateType == "" {
-			return engineapi.RuleFail(iv.rule.Name, engineapi.ImageVerify, path+": missing type"), ""
+			return engineapi.RuleFail(iv.rule.Name, engineapi.ImageVerify, path+": missing type"), "", attestations
 		}
 
 		if attestation.Type == "" && attestation.PredicateType != "" {
@@ -413,7 +426,7 @@ func (iv *ImageVerifier) verifyAttestations(
 				cosignResp, err := v.FetchAttestations(ctx, *opts)
 				if err != nil {
 					iv.logger.Error(err, "failed to fetch attestations")
-					return iv.handleRegistryErrors(image, err), ""
+					return iv.handleRegistryErrors(image, err), "", attestations
 				}
 
 				if imageInfo.Digest == "" {
@@ -424,9 +437,9 @@ func (iv *ImageVerifier) verifyAttestations(
 				attestationError = iv.verifyAttestation(cosignResp.Statements, attestation, imageInfo)
 				if attestationError != nil {
 					attestationError = fmt.Errorf("%s: %w", entryPath+subPath, attestationError)
-					return engineapi.RuleFail(iv.rule.Name, engineapi.ImageVerify, attestationError.Error()), ""
+					return engineapi.RuleFail(iv.rule.Name, engineapi.ImageVerify, attestationError.Error()), "", attestations
 				}
-
+				attestations = append(attestations, *cosignResp)
 				verifiedCount++
 				if verifiedCount >= requiredCount {
 					iv.logger.V(2).Info("image attestations verification succeeded", "verifiedCount", verifiedCount, "requiredCount", requiredCount)
@@ -436,7 +449,7 @@ func (iv *ImageVerifier) verifyAttestations(
 
 			if verifiedCount < requiredCount {
 				msg := fmt.Sprintf("image attestations verification failed, verifiedCount: %v, requiredCount: %v", verifiedCount, requiredCount)
-				return engineapi.RuleFail(iv.rule.Name, engineapi.ImageVerify, msg), ""
+				return engineapi.RuleFail(iv.rule.Name, engineapi.ImageVerify, msg), "", attestations
 			}
 		}
 
@@ -445,7 +458,7 @@ func (iv *ImageVerifier) verifyAttestations(
 
 	msg := fmt.Sprintf("verified image attestations for %s", image)
 	iv.logger.V(2).Info(msg)
-	return engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, msg), imageInfo.Digest
+	return engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, msg), imageInfo.Digest, attestations
 }
 
 func (iv *ImageVerifier) verifyAttestorSet(
@@ -697,4 +710,35 @@ func (iv *ImageVerifier) handleMutateDigest(ctx context.Context, digest string, 
 	patch := makeAddDigestPatch(imageInfo, digest)
 	iv.logger.V(4).Info("adding digest patch", "image", imageInfo.String(), "patch", patch.Json())
 	return &patch, digest, nil
+}
+
+func (iv *ImageVerifier) handleMutateEnvWithSignatures(ctx context.Context, imageInfo apiutils.ImageInfo, attestations []images.Response) ([]jsonpatch.JsonPatchOperation, error) {
+	patches := make([]jsonpatch.JsonPatchOperation, 0)
+	for _, attestation := range attestations {
+		patch := makeAddSignatureToEnvPatch(imageInfo, attestation)
+		if patch != nil {
+			iv.logger.V(4).Info("adding signatures to env", "image", imageInfo.String(), "patch", patch.Json())
+			patches = append(patches, *patch)
+		}
+
+	}
+	return patches, nil
+
+}
+
+func makeAddSignatureToEnvPatch(imageInfo apiutils.ImageInfo, attestation images.Response) *jsonpatch.JsonPatchOperation {
+	type env struct {
+		Value []map[string]interface{} `json:"value"`
+		Name  string                   `json:"name"`
+	}
+	jsonEnv, err := json.Marshal(env{Name: "KYVERNO_SIGNATURE", Value: attestation.Statements})
+	if err == nil {
+		return &jsonpatch.JsonPatchOperation{
+			Operation: "add",
+			Path:      "/spec/containers/0/env/0",
+			Value:     string(jsonEnv),
+		}
+	}
+
+	return nil
 }

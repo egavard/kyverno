@@ -33,7 +33,7 @@ import (
 )
 
 var testPolicyGood = `{
-  "apiVersion": "kyverno.io/v1",
+	"apiVersion": "kyverno.io/v1",
   "kind": "ClusterPolicy",
   "metadata": {
     "name": "attest"
@@ -52,6 +52,74 @@ var testPolicyGood = `{
         "verifyImages": [
           {
             "image": "*",
+            "key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHMmDjK65krAyDaGaeyWNzgvIu155JI50B2vezCw8+3CVeE0lJTL5dbL3OP98Za0oAEBJcOxky8Riy/XcmfKZbw==\n-----END PUBLIC KEY-----",
+            "attestations": [
+              {
+                "predicateType": "https://example.com/CodeReview/v1",
+				"attestors": [
+					{
+						"entries": [
+							{
+								"keys": {
+									"publicKeys": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHMmDjK65krAyDaGaeyWNzgvIu155JI50B2vezCw8+3CVeE0lJTL5dbL3OP98Za0oAEBJcOxky8Riy/XcmfKZbw==\n-----END PUBLIC KEY-----",
+									"rekor": {
+										"url": "https://rekor.sigstore.dev",
+										"ignoreTlog": true
+									},
+									"ctlog": {
+										"ignoreSCT": true
+									}
+								}
+							}
+						]
+					}
+				],
+                "conditions": [
+                  {
+                    "all": [
+                      {
+                        "key": "{{ repo.uri }}",
+                        "operator": "Equals",
+                        "value": "https://github.com/example/my-project"
+                      },
+                      {
+                        "key": "{{ repo.branch }}",
+                        "operator": "Equals",
+                        "value": "main"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}`
+
+var testPolicyGoodAndMutate = `{
+	"apiVersion": "kyverno.io/v1",
+  "kind": "ClusterPolicy",
+  "metadata": {
+    "name": "attest"
+  },
+  "spec": {
+    "rules": [
+      {
+        "name": "attest",
+        "match": {
+          "resources": {
+            "kinds": [
+              "Pod"
+            ]
+          }
+        },
+        "verifyImages": [
+          {
+            "image": "*",
+			"mutateEnvWithSignature": true,
             "key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHMmDjK65krAyDaGaeyWNzgvIu155JI50B2vezCw8+3CVeE0lJTL5dbL3OP98Za0oAEBJcOxky8Riy/XcmfKZbw==\n-----END PUBLIC KEY-----",
             "attestations": [
               {
@@ -328,6 +396,21 @@ func testVerifyAndPatchImages(
 		ctx,
 		pContext,
 	)
+}
+
+func Test_CosignMockAttestAndMutate(t *testing.T) {
+	policyContext := buildContext(t, testPolicyGoodAndMutate, testResource, "")
+	err := cosign.SetMock("ghcr.io/jimbugwadia/pause2:latest", attestationPayloads)
+	defer cosign.ClearMock()
+	assert.NilError(t, err)
+
+	er, ivm := testVerifyAndPatchImages(context.TODO(), registryclient.NewOrDie(), nil, policyContext, cfg)
+	assert.Equal(t, len(er.PolicyResponse.Rules), 1)
+	assert.Equal(t, er.PolicyResponse.Rules[0].Status(), engineapi.RuleStatusPass,
+		fmt.Sprintf("expected: %v, got: %v, failure: %v",
+			engineapi.RuleStatusPass, er.PolicyResponse.Rules[0].Status(), er.PolicyResponse.Rules[0].Message()))
+	assert.Equal(t, ivm.IsEmpty(), false)
+	assert.Equal(t, ivm.IsVerified("ghcr.io/jimbugwadia/pause2:latest"), true)
 }
 
 func Test_CosignMockAttest(t *testing.T) {
